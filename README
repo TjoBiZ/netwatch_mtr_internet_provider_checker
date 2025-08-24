@@ -88,3 +88,95 @@ or after chmod +x netwatch_mtr_ru.py
 Если mtr требует права, скрипт сам перезапустится через sudo.
 
 
+README.md
+# NETWATCH MTR — Route & Loss Monitor (EN/RU)
+
+## What it is (EN)
+A cross-platform (Ubuntu/macOS) diagnostic script that runs `mtr` every second and
+simultaneously pings the main target and additional IPs with the OS `ping`.
+It writes clean logs and CSV summaries to help your ISP (e.g., Xfinity) see
+**where** and **when** connectivity is lost.
+
+**Strong recommendation:** monitor not only a distant target like `8.8.8.8`,
+but also:
+- your **LAN gateway** (e.g., `10.0.0.1`),
+- your router’s **WAN IP address**,
+- the **WAN Default Gateway**,
+- and your router’s **DNS servers** (primary/secondary).
+These values are shown in the Xfinity web UI (Connection → XFINITY Network).
+
+### Key principles
+- **Loss on intermediate hops is counted only when the final target is DOWN.**
+- Hops shown as `???` at start are baseline-excluded until the route changes.
+- Sustained route change (3 consecutive snapshots, 60s apart from last rotation)
+  opens a new “epoch” file `mtr_full_epoch_N.log` and is logged to `route_changes.csv`.
+- If a route change happens while the target is DOWN for >2s, it is also noted
+  in `mtr_route_flaps.log`.
+
+### Outputs (all in `netwatch_run_<target>_<timestamp>/`)
+- `mtr_full_epoch_N.log` – per-second mtr blocks.
+- `mtr_events_lost.log` – only blocks where loss was detected on non-excluded hops.
+- `mtr_route_flaps.log` – human note when the route changed while target was DOWN >2s.
+- `summary.csv` – one row per second:
+timestamp,epoch,target_down,loss_hops_unfiltered,loss_hops_if_target_down,route_changed,route_signature
+- `extras_status.csv` – one row per second: `timestamp,target_down,<extra1>,<extra2>...` with `UP/DOWN`.
+- `agg_per_hop.csv` – aggregated counters per hop (loss seconds & first-fault count, only while target was DOWN).
+- `loss_episodes.csv` – contiguous target-down episodes with start/end/duration,
+first faulty hop and previous hop, route signatures and a snapshot of extra IPs UP/DOWN at episode start.
+- `route_changes.csv` – normalized route signatures before/after an epoch change.
+- `target_ping.log` – continuous OS `ping` to the main target.
+- `hop_pings/<IP>.txt` – continuous OS `ping` to each discovered hop (except `???` and the final target).
+- `extra_pings/<IP>.log` – continuous OS `ping` to each user-provided extra IP.
+- `INDEX.md` – quick index for the run.
+
+### Usage
+```bash
+python3 netwatch_mtr_en.py
+# or provide args:
+python3 netwatch_mtr_en.py 8.8.8.8 "10.0.0.1,73.185.71.187,73.185.70.1,75.75.75.75,75.75.76.76"
+If mtr requires privileges, the script re-execs via sudo and asks for your password.
+Notes
+Some devices (especially the CPE or upstream core) rate-limit/disable ICMP.
+* or ??? on a hop does not mean forwarding is broken if the final target is UP.
+Your router may not respond to ping on its WAN IP from LAN (hairpin/ICMP policy).
+That will appear as DOWN in extra_pings, which is expected behavior.
+Dependencies
+mtr and ping (system tools).
+gawk (optional) for inline timestamps; Python falls back to its own stamps.
+Что это такое (RU)
+Кроссплатформенный (Ubuntu/macOS) скрипт: раз в секунду запускает mtr и параллельно
+пингует системной ping целевой IP и набор дополнительных IP. Пишет аккуратные логи и
+CSV-сводки для эскалации в Xfinity.
+Рекомендация: мониторьте не только удалённую цель (например, 8.8.8.8), но и:
+LAN-шлюз (например, 10.0.0.1),
+WAN IP вашего роутера,
+WAN Default Gateway,
+DNS-серверы (primary/secondary) из панели Xfinity.
+Принципы
+Потери на промежуточных хопах считаются только когда конечная цель недоступна.
+Хопы ???, наблюдавшиеся при старте, исключаются до смены маршрута.
+Устойчивая смена маршрута (3 подряд снимка после 60с с прошлой ротации) создаёт новую
+«эпоху» mtr_full_epoch_N.log и запись в route_changes.csv.
+Если смена маршрута произошла при падении цели >2с — пишем строку в mtr_route_flaps.log.
+Выходные файлы
+См. список в секции EN — они идентичны.
+Запуск
+python3 netwatch_mtr_ru.py
+# или с аргументами:
+python3 netwatch_mtr_ru.py 8.8.8.8 "10.0.0.1,73.185.71.187,73.185.70.1,75.75.75.75,75.75.76.76"
+Если mtr требует привилегий — скрипт перезапустится через sudo.
+Зависимости
+mtr и ping (системные).
+gawk (опционально) — для меток времени; есть запасной режим в Python.
+
+---
+
+# .gitignore
+
+keep repo clean
+.git/
+netwatch_run_*/
+
+
+
+The history of script development  - https://chatgpt.com/share/68aa3e48-68c8-8009-a30e-29dbb26392be
