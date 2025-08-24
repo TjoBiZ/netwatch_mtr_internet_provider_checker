@@ -14,8 +14,8 @@ NETWATCH MTR (RU) — монитор маршрута + диагностика �
 
 Рекомендация пользователю при запуске:
 — В доп. IP через запятую укажите: LAN-шлюз (например, 10.0.0.1), WAN IP адрес
-  вашего роутера, WAN Default Gateway, и 2–3 DNS сервера (из панели Xfinity):
-  это поможет показать провайдеру, на каком звене пропадала связность.
+  вашего роутера (пример 203.0.113.10), WAN Default Gateway (пример 203.0.113.1),
+  и 2–3 DNS сервера (из панели Xfinity).
 
 Зависимости: системные mtr и ping (macOS/Ubuntu). gawk — опционально (для штампов).
 Если mtr требует привилегий — скрипт сам перезапустится через sudo (введите пароль).
@@ -29,12 +29,12 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 # ---------------------------- НАСТРОЙКИ ----------------------------
-SNAPSHOT_PERIOD_SEC = 1.0             # период mtr-снимков
-ROUTE_CHANGE_STABLE_SNAPSHOTS = 3     # сколько подряд разных сигнатур считаем «устойчивой сменой»
-ROTATION_MIN_GAP_SEC = 60             # минимальный интервал между «эпохами»
-MAX_HOP_PINGERS = 32                  # ограничение числа параллельных ping по хопам
-TARGET_LOSS_THRESHOLD_SEC = 2.0       # «серьёзный» даун цели при смене маршрута
-AGG_FLUSH_EVERY_SEC = 10              # как часто переписывать agg_per_hop.csv
+SNAPSHOT_PERIOD_SEC = 1.0
+ROUTE_CHANGE_STABLE_SNAPSHOTS = 3
+ROTATION_MIN_GAP_SEC = 60
+MAX_HOP_PINGERS = 32
+TARGET_LOSS_THRESHOLD_SEC = 2.0
+AGG_FLUSH_EVERY_SEC = 10
 
 # ---------------------------- ВСПОМОГАТЕЛЬНОЕ ----------------------------
 def ts_human() -> str: return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -111,9 +111,9 @@ def normalized_signature(hops: List[Hop], excluded_idxs: set[int]) -> str:
         parts.append(f"{h.idx}:{host}")
     return "|".join(parts)
 
-# ----------------------- Потоки ping (обычный ping ОС) -----------------------
+# ----------------------- Потоки ping -----------------------
 class PingThread(threading.Thread):
-    """Запускает системный ping -> файл <IP>.txt; добавляет таймштампы (через gawk либо в Python)."""
+    """Запускает системный ping -> файл <IP>.txt; добавляет таймштампы (через gawk или Python)."""
     def __init__(self, ip: str, outfile: Path):
         super().__init__(daemon=True); self.ip = ip; self.outfile = outfile
         self.proc: Optional[subprocess.Popen] = None
@@ -148,7 +148,7 @@ class PingThread(threading.Thread):
             except Exception: pass
 
 class StatefulPingThread(PingThread):
-    """Как PingThread, но ещё определяет состояние UP/DOWN по содержимому строк."""
+    """Определяет состояние UP/DOWN по содержимому строк ping."""
     _TS_PREFIX_RE = re.compile(r"^\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\]\s*")
     def __init__(self, ip: str, outfile: Path):
         super().__init__(ip, outfile)
@@ -204,7 +204,6 @@ class NetwatchMTR:
         self.extras = [ip.strip() for ip in extras if ip.strip()]
         self.root = Path(f"netwatch_run_{self.target}_{ts_file()}"); self.root.mkdir(parents=True, exist_ok=True)
 
-        # файлы/папки
         self.events_log = self.root/"mtr_events_lost.log"
         self.flaps_log  = self.root/"mtr_route_flaps.log"
         self.summary_csv= self.root/"summary.csv"
@@ -217,7 +216,6 @@ class NetwatchMTR:
         self.extras_dir = self.root/"extra_pings"; self.extras_dir.mkdir(exist_ok=True)
         self.target_ping_file = self.root/"target_ping.log"
 
-        # эпохи/состояния
         self.epoch_id=0; self.full_log=self._new_epoch_full_log()
         self.pingers: Dict[str, PingThread]={}
         self.prev_norm_sig: Optional[str]=None
@@ -225,14 +223,11 @@ class NetwatchMTR:
         self.pending_sig:Optional[str]=None; self.pending_count=0
         self.last_rotation_at = datetime.min
 
-        # цель: отдельный stateful-ping
         self.target_pinger = StatefulPingThread(self.target, self.target_ping_file); self.target_pinger.start()
-        # доп. IP: stateful-ping
         self.extra_threads: Dict[str, StatefulPingThread]={}
         for ip in self.extras:
             th = StatefulPingThread(ip, self.extras_dir/f"{ip}.log"); th.start(); self.extra_threads[ip]=th
 
-        # эпизоды падения цели
         self.target_down_prev=False
         self.current_episode_start: Optional[datetime]=None
         self.current_episode_first_fault: Optional[Tuple[int,str,str]]=None
@@ -240,13 +235,11 @@ class NetwatchMTR:
         self.norm_sig_at_episode_start=""; self.norm_sig_at_episode_end=""
         self.extras_snapshot_start_up:List[str]=[]; self.extras_snapshot_start_down:List[str]=[]
 
-        # агрегаты по хопам
         self.hop_stats: Dict[str, Dict[str, int]]={}
         self.first_fault_current_ip: Optional[str]=None
         self.first_fault_active=False
         self.last_agg_flush=time.time()
 
-        # заголовки CSV
         if not self.summary_csv.exists():
             with self.summary_csv.open("w",encoding="utf-8") as f:
                 f.write("timestamp,epoch,target_down,loss_hops_unfiltered,loss_hops_if_target_down,route_changed,route_signature\n")
@@ -447,7 +440,7 @@ def main()->None:
     if len(sys.argv)>=3:
         extras_csv=sys.argv[2]
     else:
-        extras_csv=input("Дополнительные IP через запятую (например: 10.0.0.1,73.185.71.187,73.185.70.1,75.75.75.75,75.75.76.76): ").strip()
+        extras_csv=input("Доп. IP через запятую (например: 10.0.0.1,203.0.113.10,203.0.113.1,75.75.75.75,75.75.76.76): ").strip()
     extras=[x.strip() for x in (extras_csv.split(",") if extras_csv else []) if x.strip()]
 
     ensure_mtr_or_reexec_with_sudo(target)
@@ -455,7 +448,7 @@ def main()->None:
     mon=NetwatchMTR(target,extras)
 
     def on_sigint(signum,frame):
-        print(f\"\n{ts_br()} Завершение...\")
+        print(f"\n{ts_br()} Завершение...")
         for th in mon.pingers.values(): th.stop()
         for th in mon.pingers.values(): th.join(timeout=2)
         for th in mon.extra_threads.values(): th.stop()
@@ -463,7 +456,7 @@ def main()->None:
         if mon.target_pinger:
             mon.target_pinger.stop(); mon.target_pinger.join(timeout=2)
         mon._flush_agg_csv()
-        print(f\"{ts_br()} Готово. Каталог: {mon.root}\")
+        print(f"{ts_br()} Готово. Каталог: {mon.root}")
         sys.exit(0)
 
     signal.signal(signal.SIGINT, on_sigint)

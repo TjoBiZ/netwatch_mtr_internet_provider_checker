@@ -1,94 +1,3 @@
-README (English)
-
-NETWATCH MTR — Route & Packet-Loss Logger for Xfinity Troubleshooting (Linux/macOS)
-
-We’re investigating intermittent connectivity with Xfinity. The suspicion: the ISP core occasionally reconverges (e.g., OSPF/ECMP), routes flap, and the target (e.g., 8.8.8.8) becomes unreachable for short bursts. This tool continuously records hop-by-hop state and correlates it with target reachability.
-
-Key Principle (Axiom)
-
-Intermediate-hop loss is counted only while the final target is down.
-If the target is reachable, intermediate losses are not treated as service impact — they may simply reflect ICMP deprioritization or transient re-routing.
-
-What the script produces (inside netwatch_run_<target>_<YYYYMMDD_HHMMSS>/)
-	•	mtr_full_epoch_<N>.log — full mtr snapshots every second for a debounced epoch (route needs to stabilize to a new normalized signature for ≥3 snapshots; epochs are spaced ≥60s apart).
-	•	mtr_events_lost.log — only the loss periods (per-second mtr blocks) plus single-line OK interval summaries.
-	•	mtr_route_flaps.log — only route changes that coincide with target ping loss >2s (at the change or within 5s after).
-	•	target_ping.log — timestamped raw output of system ping to the target across the whole run.
-	•	hop_pings/<IP>.txt — timestamped raw ping to each hop IP (except ??? and the target).
-	•	summary.csv — per-second summary:
-timestamp,epoch,target_down,loss_hops_unfiltered,loss_hops_if_target_down,route_changed,route_signature
-
-
-	•	agg_per_hop.csv — consolidated diagnostics per hop (AXIOM-aware):
-ip,loss_seconds_when_target_down,first_fault_events
-
-	•	loss_seconds_when_target_down: how many seconds this hop showed loss>0 while the target was down.
-	•	first_fault_events: how many times this hop was the earliest problematic hop during target-down seconds.
-
-	•	loss_episodes.csv — each target-down episode with context:
-start,end,duration_s,first_fault_idx,first_fault_ip,prev_ip_before_fault,
-route_changes_in_episode,norm_sig_start,norm_sig_end
-
-This tells Xfinity where loss typically starts and whether the network was reconverging.
-
-	•	route_changes.csv — debounced route changes (normalized signatures) with epoch numbers:
-timestamp,epoch_before,epoch_after,old_norm_sig,new_norm_sig
-
-	•	INDEX.md — small index of epochs and files.
-
-Why this format is friendly for ISPs
-	•	Shows when the target was actually down and which hop was first to misbehave.
-	•	Gives correlation between route changes and customer impact (>2s gaps).
-	•	Keeps a full track of per-hop ping streams for micro-analysis.
-
-How to run
-python3 netwatch_mtr_en.py 8.8.8.8
-# or run without argument and type the target $./netwatch_mtr_en.py
-
-If mtr needs privileges, the script auto re-execs itself with sudo so you can enter your password.
-
-
-⸻
-
-
-
-README (Русская версия)
-
-NETWATCH MTR — логгер маршрута и потерь для диагностики Xfinity (Linux/macOS)
-
-Диагностируем прерывания у Xfinity. Предположение: ядро провайдера периодически перестраивает маршруты (OSPF/ECMP), маршрут флапает, и цель (8.8.8.8) становится недоступной на короткие промежутки. Скрипт непрерывно снимает состояние по хопам и связывает его с доступностью цели.
-
-Главная аксиома
-
-Потери на промежуточных хопах учитываем только тогда, когда конечная цель недоступна.
-Если цель отвечает — промежуточные loss% не считаем проблемой сервиса (часто это ICMP-дропы или перестройка).
-
-Что создаётся (в netwatch_run_<target>_<YYYYMMDD_HHMMSS>/)
-	•	mtr_full_epoch_<N>.log — полный mtr каждую секунду в рамках эпохи (смена маршрута с дебаунсом).
-	•	mtr_events_lost.log — только периоды потерь + строки OK interval.
-	•	mtr_route_flaps.log — только те смены маршрута, что совпали с падением цели >2с (в момент или в течение 5с после).
-	•	target_ping.log — непрерывный системный ping цели с таймштампами.
-	•	hop_pings/<IP>.txt — непрерывные ping по IP-хопам.
-	•	summary.csv — сводка по секундам (loss/route_changed/signature).
-	•	agg_per_hop.csv — агрегат по каждому IP-хопу с учётом аксиомы:
-	•	loss_seconds_when_target_down — сколько секунд на хопе был loss>0, пока цель была DOWN;
-	•	first_fault_events — сколько раз этот хоп был первым проблемным при падении цели.
-	•	loss_episodes.csv — эпизоды падения цели с деталями (кто был первым виновником, сколько смен маршрута внутри эпизода, сигнатуры до/после).
-	•	route_changes.csv — смены маршрута (нормализованные сигнатуры) с номерами эпох.
-	•	INDEX.md — индекс.
-
-Запуск
-
-python3 netwatch_mtr_ru.py 8.8.8.8
-
-or after chmod +x netwatch_mtr_ru.py
-
-./netwatch_mtr_ru.py
-
-Если mtr требует права, скрипт сам перезапустится через sudo.
-
-
-README.md
 # NETWATCH MTR — Route & Loss Monitor (EN/RU)
 
 ## What it is (EN)
@@ -100,8 +9,8 @@ It writes clean logs and CSV summaries to help your ISP (e.g., Xfinity) see
 **Strong recommendation:** monitor not only a distant target like `8.8.8.8`,
 but also:
 - your **LAN gateway** (e.g., `10.0.0.1`),
-- your router’s **WAN IP address**,
-- the **WAN Default Gateway**,
+- your router’s **WAN IP address** (example `203.0.113.10`),
+- the **WAN Default Gateway** (example `203.0.113.1`),
 - and your router’s **DNS servers** (primary/secondary).
 These values are shown in the Xfinity web UI (Connection → XFINITY Network).
 
@@ -118,11 +27,11 @@ These values are shown in the Xfinity web UI (Connection → XFINITY Network).
 - `mtr_events_lost.log` – only blocks where loss was detected on non-excluded hops.
 - `mtr_route_flaps.log` – human note when the route changed while target was DOWN >2s.
 - `summary.csv` – one row per second:
-timestamp,epoch,target_down,loss_hops_unfiltered,loss_hops_if_target_down,route_changed,route_signature
-- `extras_status.csv` – one row per second: `timestamp,target_down,<extra1>,<extra2>...` with `UP/DOWN`.
+  `timestamp,epoch,target_down,loss_hops_unfiltered,loss_hops_if_target_down,route_changed,route_signature`
+- `extras_status.csv` – per-second `UP/DOWN` for extra IPs.
 - `agg_per_hop.csv` – aggregated counters per hop (loss seconds & first-fault count, only while target was DOWN).
 - `loss_episodes.csv` – contiguous target-down episodes with start/end/duration,
-first faulty hop and previous hop, route signatures and a snapshot of extra IPs UP/DOWN at episode start.
+  first faulty hop and previous hop, route signatures and a snapshot of extra IPs UP/DOWN at episode start.
 - `route_changes.csv` – normalized route signatures before/after an epoch change.
 - `target_ping.log` – continuous OS `ping` to the main target.
 - `hop_pings/<IP>.txt` – continuous OS `ping` to each discovered hop (except `???` and the final target).
@@ -133,50 +42,51 @@ first faulty hop and previous hop, route signatures and a snapshot of extra IPs 
 ```bash
 python3 netwatch_mtr_en.py
 # or provide args:
-python3 netwatch_mtr_en.py 8.8.8.8 "10.0.0.1,73.185.71.187,73.185.70.1,75.75.75.75,75.75.76.76"
+python3 netwatch_mtr_en.py 8.8.8.8 "10.0.0.1,203.0.113.10,203.0.113.1,75.75.75.75,75.75.76.76"
+
+
 If mtr requires privileges, the script re-execs via sudo and asks for your password.
+
 Notes
-Some devices (especially the CPE or upstream core) rate-limit/disable ICMP.
-* or ??? on a hop does not mean forwarding is broken if the final target is UP.
-Your router may not respond to ping on its WAN IP from LAN (hairpin/ICMP policy).
-That will appear as DOWN in extra_pings, which is expected behavior.
-Dependencies
-mtr and ping (system tools).
-gawk (optional) for inline timestamps; Python falls back to its own stamps.
+	•	Some devices rate-limit ICMP. */??? on a hop doesn’t mean forwarding is broken if the final target is UP.
+	•	Many routers won’t answer pings sent to their WAN IP from the LAN side; such extra pings can legitimately show DOWN.
+
+⸻
+
 Что это такое (RU)
+
 Кроссплатформенный (Ubuntu/macOS) скрипт: раз в секунду запускает mtr и параллельно
-пингует системной ping целевой IP и набор дополнительных IP. Пишет аккуратные логи и
+пингует системной ping целевой IP и дополнительные IP. Пишет аккуратные логи и
 CSV-сводки для эскалации в Xfinity.
-Рекомендация: мониторьте не только удалённую цель (например, 8.8.8.8), но и:
-LAN-шлюз (например, 10.0.0.1),
-WAN IP вашего роутера,
-WAN Default Gateway,
-DNS-серверы (primary/secondary) из панели Xfinity.
+
+Рекомендуется мониторить не только удалённую цель (8.8.8.8), но и:
+	•	LAN-шлюз (например, 10.0.0.1),
+	•	WAN IP роутера (пример 203.0.113.10),
+	•	WAN Default Gateway (пример 203.0.113.1),
+	•	DNS-серверы (primary/secondary) из панели Xfinity.
+
 Принципы
-Потери на промежуточных хопах считаются только когда конечная цель недоступна.
-Хопы ???, наблюдавшиеся при старте, исключаются до смены маршрута.
-Устойчивая смена маршрута (3 подряд снимка после 60с с прошлой ротации) создаёт новую
-«эпоху» mtr_full_epoch_N.log и запись в route_changes.csv.
-Если смена маршрута произошла при падении цели >2с — пишем строку в mtr_route_flaps.log.
-Выходные файлы
-См. список в секции EN — они идентичны.
+	•	Потери на промежуточных хопах считаем только когда конечная цель недоступна.
+	•	Хопы ??? из первого снимка исключаются до смены маршрута.
+	•	Устойчивая смена маршрута (3 подряд снимка, минимум 60с от прошлой ротации)
+— новая «эпоха» mtr_full_epoch_N.log и запись в route_changes.csv.
+	•	Если смена маршрута произошла при падении цели >2с — строка в mtr_route_flaps.log.
+
 Запуск
+
 python3 netwatch_mtr_ru.py
 # или с аргументами:
-python3 netwatch_mtr_ru.py 8.8.8.8 "10.0.0.1,73.185.71.187,73.185.70.1,75.75.75.75,75.75.76.76"
+python3 netwatch_mtr_ru.py 8.8.8.8 "10.0.0.1,203.0.113.10,203.0.113.1,75.75.75.75,75.75.76.76"
+
 Если mtr требует привилегий — скрипт перезапустится через sudo.
-Зависимости
-mtr и ping (системные).
-gawk (опционально) — для меток времени; есть запасной режим в Python.
 
 ---
 
-# .gitignore
+## .gitignore
 
 keep repo clean
+
 .git/
 netwatch_run_*/
 
 
-
-The history of script development  - https://chatgpt.com/share/68aa3e48-68c8-8009-a30e-29dbb26392be

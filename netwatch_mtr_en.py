@@ -440,7 +440,7 @@ def main()->None:
     if len(sys.argv)>=3:
         extras_csv=sys.argv[2]
     else:
-        extras_csv=input("Extra IPs (comma-separated; e.g., 10.0.0.1,73.185.71.187,73.185.70.1,75.75.75.75,75.75.76.76): ").strip()
+        extras_csv=input("Extra IPs (comma-separated; e.g., 10.0.0.1,203.0.113.10,203.0.113.1,75.75.75.75,75.75.76.76): ").strip()
     extras=[x.strip() for x in (extras_csv.split(",") if extras_csv else []) if x.strip()]
 
     ensure_mtr_or_reexec_with_sudo(target)
@@ -448,7 +448,7 @@ def main()->None:
     mon=NetwatchMTR(target,extras)
 
     def on_sigint(signum,frame):
-        print(f\"\n{ts_br()} Shutting down...\")
+        print(f"\n{ts_br()} Shutting down...")
         for th in mon.pingers.values(): th.stop()
         for th in mon.pingers.values(): th.join(timeout=2)
         for th in mon.extra_threads.values(): th.stop()
@@ -456,7 +456,7 @@ def main()->None:
         if mon.target_pinger:
             mon.target_pinger.stop(); mon.target_pinger.join(timeout=2)
         mon._flush_agg_csv()
-        print(f\"{ts_br()} Done. Folder: {mon.root}\")
+        print(f"{ts_br()} Done. Folder: {mon.root}")
         sys.exit(0)
 
     signal.signal(signal.SIGINT, on_sigint)

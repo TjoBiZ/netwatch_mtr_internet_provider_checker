@@ -7,7 +7,7 @@ Musts
 3) mtr snapshot cadence = 1 sec (1 probe per hop per second). If mtr requires privileges, auto-reexec via sudo and prompt for the user’s password.
 4) Baseline exclusions: at start, any “???” hops present are permanently excluded from loss accounting until the route changes.
 5) Loss axiom: count loss on intermediate hops ONLY if the final target is DOWN at that second.
-6) Loss logging: 
+6) Loss logging:
    - `mtr_events_lost.log` contains ONLY snapshots/blocks when loss is detected (per second) on any non-excluded hop.
    - `loss_episodes.csv` records contiguous target-down episodes with start/end/duration, first faulty hop, previous hop, route signatures and whether the route changed during the episode; also record which extra IPs were UP/DOWN at the episode start.
 7) Route changes: form a normalized route signature (index:IP, with excluded “???”). If signature is different for 3 consecutive snapshots and at least 60s passed since last rotation, start a new epoch (files continue under the same run folder but `mtr_full_epoch_N.log` increases). Log changes to `route_changes.csv`.
@@ -35,33 +35,23 @@ Non-goals
 Deliverables
 - `netwatch_mtr_ru.py` (Russian), `netwatch_mtr_en.py` (English), `README.md` (EN primary + RU section), `.gitignore`.
 
-
-Технический Prompt (само-задание скрипта)
-	1.	Ввод цели: спросить или принять аргументом IPv4/хост (например, 8.8.8.8).
-	2.	Только mtr: каждые ~1 сек запускать mtr -r -w -n -c 1 -i 1 <target>. Блок выводить в консоль и писать в «полный лог» текущей эпохи.
-	3.	Рабочая папка запуска: netwatch_run_<target>_<TS>/. Внутри:
-	•	mtr_full_epoch_<N>.log — полный mtr за эпоху;
-	•	mtr_events_lost.log — только периоды потерь (ежесекундные блоки) + строки OK interval: …;
-	•	mtr_route_flaps.log — записи лишь тогда, когда смена маршрута совпала с падением цели >2с (в момент смены или в течение 5с после);
-	•	target_ping.log — непрерывный системный ping до цели;
-	•	hop_pings/<IP>.txt — непрерывные ping по доступным IP-хопам (не ???, не сама цель);
-	•	summary.csv — построчная сводка раз в секунду;
-	•	agg_per_hop.csv — агрегат по каждому IP-хопу (см. п.6);
-	•	loss_episodes.csv — эпизоды недоступности цели с деталями (см. п.7);
-	•	route_changes.csv — CSV-журнал смен маршрута;
-	•	INDEX.md — короткий индекс файлами.
-	4.	Базовые “дыры”: в первом снимке эпохи собрать индексы с ??? и исключить их из детекции потерь и решений о ротации в пределах эпохи.
-	5.	Ротация (debounce): переход в новую эпоху только если нормализованная сигнатура (на исключённых индексах всегда ???) держится ≥3 подряд снимка и прошло ≥60с с предыдущей ротации.
-	6.	Аксиома учёта потерь:
-	•	Потери на промежуточных хопах учитываются только когда цель сейчас не отвечает (по системному ping).
-	•	Вести агрегат по IP-хопам:
-loss_seconds_when_target_down (сколько секунд наблюдался loss>0 на хопе во время «цель не отвечает»),
-first_fault_events (сколько раз этот хоп был первым проблемным в секунде, когда цель не отвечала).
-	7.	Эпизоды падения цели: когда цель переходит OK → DOWN, создать эпизод; когда DOWN → OK — закрыть эпизод и записать строку в loss_episodes.csv:
-start, end, duration_s, first_fault_hop_idx, first_fault_ip, prev_ip_before_fault, route_changes_in_episode, norm_sig_start, norm_sig_end.
-	8.	Первые виновники: в каждой секунде «цель DOWN» находить самый ранний (минимальный индекс) хоп, где (loss>0 или host=='???' у не исключённого индекса). Его и считать «первым виновником». В loss_episodes.csv писать ещё и prev_ip_before_fault — IP с предыдущего хопа (если есть).
-	9.	Маршрут ↔ цель: вести route_changes.csv (время, старая/новая нормализованные сигнатуры, epoch_before→epoch_after) и считать route_changes_in_episode для текущего эпизода. В mtr_route_flaps.log писать только коррелированные (см. п.3).
-	10.	Системные утилиты: только mtr и системный ping (Linux/macOS), опционально gawk для таймштампов.
-	11.	Привилегии: если mtr требует root (raw sockets), автоперезапустить скрипт через sudo (чтобы можно было ввести пароль).
-	12.	Завершение: по Ctrl+C корректно остановить все подпроцессы и дописать агрегаты.
-	13.	History creating mtr script - tester internet provider - https://chatgpt.com/share/68aa3e48-68c8-8009-a30e-29dbb26392be
+Technical Prompt (self-spec in RU)
+1. Ввод цели: спросить/принять IPv4/хост (например, 8.8.8.8).
+2. Только mtr раз в ~1 сек: `mtr -r -w -n -c 1 -i 1 <target>`. Блок выводить в консоль и писать в «полный лог» текущей эпохи.
+3. Рабочая папка: `netwatch_run_<target>_<TS>/`:
+   • `mtr_full_epoch_<N>.log` — полный mtr;  
+   • `mtr_events_lost.log` — только секунды с потерями на не исключённых хопах;  
+   • `mtr_route_flaps.log` — когда смена маршрута совпадает с дауном цели >2с;  
+   • `target_ping.log` — непрерывный системный ping цели;  
+   • `hop_pings/<IP>.txt` — непрерывные ping по IP-хопам;  
+   • `extra_pings/<IP>.log` — пинг всех доп. IP;  
+   • `summary.csv`, `extras_status.csv`, `agg_per_hop.csv`, `loss_episodes.csv`, `route_changes.csv`, `INDEX.md`.
+4. Базовые исключения: индексы с `???` в первом снимке эпохи исключать до смены маршрута.
+5. Ротация эпохи: новая эпоха, если нормализованная сигнатура держится ≥3 подряд и прошло ≥60с с предыдущей ротации.
+6. Аксиома: потери на промежуточных хопах учитываются только когда цель DOWN. Вести два счётчика на IP-хоп: `loss_seconds_when_target_down` и `first_fault_events`.
+7. Эпизоды падения цели: при переходе OK→DOWN открыть эпизод; при DOWN→OK закрыть и записать: `start,end,duration_s,first_fault_idx,first_fault_ip,prev_ip_before_fault,route_changes_in_episode,norm_sig_start,norm_sig_end,extras_up_at_start,extras_down_at_start`.
+8. Первый виновник: в секунду «цель DOWN» — минимальный индекс, где `(loss>0 || host=='???' у не исключённого индекса)`. Также писать `prev_ip_before_fault`.
+9. Route changes: вести `route_changes.csv` и `mtr_route_flaps.log` (если совпало с дауном цели >2с).
+10. Привилегии: если mtr требует root — авто-reexec через sudo.
+11. Завершение: Ctrl+C — корректно остановить подпроцессы, дописать агрегаты.
+12. Рекомендация пользователю: в списке доп. IP указывать LAN GW (например, 10.0.0.1), WAN IP (пример `203.0.113.10`), WAN Default GW (пример `203.0.113.1`) и DNS.
