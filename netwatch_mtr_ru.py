@@ -3,22 +3,26 @@
 """
 NETWATCH MTR (RU) — монитор маршрута + диагностика потерь для эскалации в Xfinity.
 
-Главная идея:
-— Снимаем mtr каждые 1 сек (1 пакет/сек/хоп), параллельно пингуем целевой IP и набор
-  дополнительных IP (LAN-шлюз/ WAN IP/ WAN GW/ DNS) обычной утилитой ping.
-— Потери на промежуточных хопах считаем ТОЛЬКО когда недоступна конечная цель
-  (аксиома диагностики э2э).
-— «Немые» хопы (???), замеченные при старте, не считаем за проблемы — исключаем их
-  индексы до смены маршрута. Если маршрут стабильно изменился, начинаем «эпоху» №+1.
-— Логи аккуратно разложены по файлам; CSV-сводки — по 1 строке в секунду.
+Что делает скрипт:
+- Каждую секунду запускает `mtr -r -w -n -c 1 -i 1 <цель>` и пишет блок в консоль и файл эпохи.
+- Параллельно пингует:
+    * целевой IP (stateful: определяет UP/DOWN),
+    * каждый обнаруженный IP-хоп (простой непрерывный ping с таймштампами),
+    * каждый указанный пользователем «дополнительный IP» (stateful: UP/DOWN).
+- Потери на промежуточных хопах учитываются **только когда конечная цель DOWN** в эту секунду.
+- Хопы `???`, замеченные в первом снимке эпохи, исключаются до смены маршрута (дебаунс).
+- Все логи и CSV складываются в отдельную папку запуска.
 
-Рекомендация пользователю при запуске:
-— В доп. IP через запятую укажите: LAN-шлюз (например, 10.0.0.1), WAN IP адрес
-  вашего роутера (пример 203.0.113.10), WAN Default Gateway (пример 203.0.113.1),
-  и 2–3 DNS сервера (из панели Xfinity).
+Почему раньше падал gawk:
+- Пайп строился через `/bin/bash -lc` с экранированием кавычек, и `gawk` видел символы `\"`.
+  Теперь `ping` и `gawk` запускаются как **два процесса** через `subprocess` (без шелла),
+  awk-программа передаётся отдельным аргументом — ошибок кавычек больше нет.
 
-Зависимости: системные mtr и ping (macOS/Ubuntu). gawk — опционально (для штампов).
-Если mtr требует привилегий — скрипт сам перезапустится через sudo (введите пароль).
+Только системные утилиты:
+- `mtr` и `ping` (Ubuntu/macOS). `gawk` — опционально; при отсутствии таймштампы ставит Python.
+
+Если `mtr` требует привилегий:
+- Скрипт сам перезапустится через `sudo` (будет запрос пароля).
 """
 
 from __future__ import annotations
@@ -38,8 +42,8 @@ AGG_FLUSH_EVERY_SEC = 10
 
 # ---------------------------- ВСПОМОГАТЕЛЬНОЕ ----------------------------
 def ts_human() -> str: return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-def ts_file() -> str:  return datetime.now().strftime("%Y%m%d_%H%M%S")
-def ts_br() -> str:    return "[" + ts_human() + "]"
+def ts_file()  -> str: return datetime.now().strftime("%Y%m%d_%H%M%S")
+def ts_br()    -> str: return "[" + ts_human() + "]"
 def have(cmd: str) -> bool: return shutil.which(cmd) is not None
 def on_linux() -> bool: return sys.platform.startswith("linux")
 def on_macos() -> bool: return sys.platform == "darwin"
@@ -113,11 +117,21 @@ def normalized_signature(hops: List[Hop], excluded_idxs: set[int]) -> str:
 
 # ----------------------- Потоки ping -----------------------
 class PingThread(threading.Thread):
-    """Запускает системный ping -> файл <IP>.txt; добавляет таймштампы (через gawk или Python)."""
+    """
+    Непрерывный системный ping одного IP с таймштампами.
+    - Если есть gawk: запускаем два процесса и соединяем их пайпом:
+          ping ...  |  gawk '{ print strftime("[%Y-%m-%d %H:%M:%S]"), $0; fflush(); }'
+      (без шелла — никаких проблем с кавычками).
+    - Если gawk нет: таймштампы добавляет Python.
+    """
     def __init__(self, ip: str, outfile: Path):
-        super().__init__(daemon=True); self.ip = ip; self.outfile = outfile
+        super().__init__(daemon=True)
+        self.ip = ip
+        self.outfile = outfile
         self.proc: Optional[subprocess.Popen] = None
-        self.stop_evt = threading.Event(); self.have_gawk = have("gawk")
+        self.proc_ping: Optional[subprocess.Popen] = None
+        self.stop_evt = threading.Event()
+        self.have_gawk = have("gawk")
 
     def _cmd(self) -> List[str]:
         if on_linux(): return ["ping", "-n", "-O", "-i", "1", self.ip]
@@ -127,36 +141,59 @@ class PingThread(threading.Thread):
         self.outfile.parent.mkdir(parents=True, exist_ok=True)
         with self.outfile.open("a", encoding="utf-8") as f:
             f.write(f"{ts_br()} [START ping {self.ip}]\n"); f.flush()
+
             if self.have_gawk:
-                shell_cmd = " ".join(self._cmd()) + r" | gawk '{ print strftime(\"[%Y-%m-%d %H:%M:%S]\"), $0; fflush(); }'"
-                self.proc = subprocess.Popen(["/bin/bash","-lc",shell_cmd],
-                    stdout=f, stderr=subprocess.STDOUT, text=True, bufsize=1)
+                self.proc_ping = subprocess.Popen(
+                    self._cmd(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1
+                )
+                awk_program = '{ print strftime("[%Y-%m-%d %H:%M:%S]"), $0; fflush(); }'
+                self.proc = subprocess.Popen(
+                    ["gawk", awk_program],
+                    stdin=self.proc_ping.stdout, stdout=f, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1
+                )
                 while not self.stop_evt.is_set() and self.proc.poll() is None:
                     time.sleep(0.2)
             else:
-                self.proc = subprocess.Popen(self._cmd(),
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+                self.proc = subprocess.Popen(
+                    self._cmd(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1
+                )
                 for line in self.proc.stdout:
-                    if self.stop_evt.is_set(): break
+                    if self.stop_evt.is_set():
+                        break
                     f.write(f"{ts_br()} {line.rstrip()}\n"); f.flush()
+
             f.write(f"{ts_br()} [STOP  ping {self.ip}]\n"); f.flush()
 
     def stop(self) -> None:
         self.stop_evt.set()
-        if self.proc and self.proc.poll() is None:
-            try: self.proc.terminate()
-            except Exception: pass
+        try:
+            if self.proc and self.proc.poll() is None:
+                self.proc.terminate()
+        except Exception:
+            pass
+        try:
+            if self.proc_ping and self.proc_ping.poll() is None:
+                self.proc_ping.terminate()
+        except Exception:
+            pass
 
 class StatefulPingThread(PingThread):
-    """Определяет состояние UP/DOWN по содержимому строк ping."""
+    """Как PingThread, но ещё определяет UP/DOWN по содержимому строк."""
     _TS_PREFIX_RE = re.compile(r"^\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\]\s*")
+
     def __init__(self, ip: str, outfile: Path):
         super().__init__(ip, outfile)
-        self.lock = threading.Lock(); self.down_active=False; self.down_start:Optional[datetime]=None
+        self.lock = threading.Lock()
+        self.down_active: bool = False
+        self.down_start: Optional[datetime] = None
 
     def _classify(self, line: str) -> Optional[bool]:
         s = line.strip()
-        if not s: return None
+        if not s:
+            return None
         s = self._TS_PREFIX_RE.sub("", s)
         if "bytes from" in s or "time=" in s: return True
         if "Request timeout" in s or "no answer yet" in s: return False
@@ -166,36 +203,56 @@ class StatefulPingThread(PingThread):
 
     def run(self) -> None:
         self.outfile.parent.mkdir(parents=True, exist_ok=True)
-        if self.have_gawk:
-            shell_cmd = " ".join(self._cmd()) + r" | gawk '{ print strftime(\"[%Y-%m-%d %H:%M:%S]\"), $0; fflush(); }'"
-            popen_cmd = ["/bin/bash","-lc",shell_cmd]
-        else:
-            popen_cmd = self._cmd()
         with self.outfile.open("a", encoding="utf-8") as f:
             f.write(f"{ts_br()} [START ping {self.ip}]\n"); f.flush()
-            self.proc = subprocess.Popen(popen_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+
+            if self.have_gawk:
+                self.proc_ping = subprocess.Popen(
+                    self._cmd(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1
+                )
+                awk_program = '{ print strftime("[%Y-%m-%d %H:%M:%S]"), $0; fflush(); }'
+                self.proc = subprocess.Popen(
+                    ["gawk", awk_program],
+                    stdin=self.proc_ping.stdout, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1
+                )
+                stream = self.proc.stdout
+            else:
+                self.proc = subprocess.Popen(
+                    self._cmd(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1
+                )
+                stream = self.proc.stdout
+
             try:
-                for line in self.proc.stdout:
-                    if self.stop_evt.is_set(): break
-                    if self.have_gawk: f.write(line.rstrip()+"\n")
-                    else:              f.write(f"{ts_br()} {line.rstrip()}\n")
+                for line in stream:
+                    if self.stop_evt.is_set():
+                        break
+                    if self.have_gawk:
+                        f.write(line.rstrip() + "\n")
+                    else:
+                        f.write(f"{ts_br()} {line.rstrip()}\n")
                     f.flush()
+
                     kind = self._classify(line)
                     now = datetime.now()
                     with self.lock:
                         if kind is True:
-                            self.down_active=False; self.down_start=None
+                            self.down_active = False
+                            self.down_start = None
                         elif kind is False:
                             if not self.down_active:
-                                self.down_active=True; self.down_start=now
+                                self.down_active = True
+                                self.down_start = now
             finally:
                 f.write(f"{ts_br()} [STOP  ping {self.ip}]\n"); f.flush()
 
-    def loss_state(self) -> Tuple[bool,float,Optional[datetime]]:
+    def loss_state(self) -> Tuple[bool, float, Optional[datetime]]:
         with self.lock:
             if self.down_active and self.down_start:
-                return True,(datetime.now()-self.down_start).total_seconds(),self.down_start
-            return False,0.0,None
+                return True, (datetime.now() - self.down_start).total_seconds(), self.down_start
+            return False, 0.0, None
 
 # ------------------------------- Монитор -------------------------------
 class NetwatchMTR:
@@ -204,212 +261,261 @@ class NetwatchMTR:
         self.extras = [ip.strip() for ip in extras if ip.strip()]
         self.root = Path(f"netwatch_run_{self.target}_{ts_file()}"); self.root.mkdir(parents=True, exist_ok=True)
 
-        self.events_log = self.root/"mtr_events_lost.log"
-        self.flaps_log  = self.root/"mtr_route_flaps.log"
-        self.summary_csv= self.root/"summary.csv"
-        self.extras_csv = self.root/"extras_status.csv"
-        self.agg_csv    = self.root/"agg_per_hop.csv"
-        self.episodes_csv = self.root/"loss_episodes.csv"
-        self.routechg_csv  = self.root/"route_changes.csv"
-        self.index_md   = self.root/"INDEX.md"
-        self.hops_dir   = self.root/"hop_pings"; self.hops_dir.mkdir(exist_ok=True)
-        self.extras_dir = self.root/"extra_pings"; self.extras_dir.mkdir(exist_ok=True)
-        self.target_ping_file = self.root/"target_ping.log"
+        self.events_log   = self.root / "mtr_events_lost.log"
+        self.flaps_log    = self.root / "mtr_route_flaps.log"
+        self.summary_csv  = self.root / "summary.csv"
+        self.extras_csv   = self.root / "extras_status.csv"
+        self.agg_csv      = self.root / "agg_per_hop.csv"
+        self.episodes_csv = self.root / "loss_episodes.csv"
+        self.routechg_csv = self.root / "route_changes.csv"
+        self.index_md     = self.root / "INDEX.md"
+        self.hops_dir     = self.root / "hop_pings";   self.hops_dir.mkdir(exist_ok=True)
+        self.extras_dir   = self.root / "extra_pings"; self.extras_dir.mkdir(exist_ok=True)
+        self.target_ping_file = self.root / "target_ping.log"
 
-        self.epoch_id=0; self.full_log=self._new_epoch_full_log()
-        self.pingers: Dict[str, PingThread]={}
-        self.prev_norm_sig: Optional[str]=None
-        self.excluded_idxs:set[int]=set(); self.baseline_set=False
-        self.pending_sig:Optional[str]=None; self.pending_count=0
+        self.epoch_id = 0
+        self.full_log = self._new_epoch_full_log()
+        self.pingers: Dict[str, PingThread] = {}
+        self.prev_norm_sig: Optional[str] = None
+        self.excluded_idxs: set[int] = set()
+        self.baseline_set = False
+        self.pending_sig: Optional[str] = None
+        self.pending_count = 0
         self.last_rotation_at = datetime.min
 
         self.target_pinger = StatefulPingThread(self.target, self.target_ping_file); self.target_pinger.start()
-        self.extra_threads: Dict[str, StatefulPingThread]={}
+        self.extra_threads: Dict[str, StatefulPingThread] = {}
         for ip in self.extras:
-            th = StatefulPingThread(ip, self.extras_dir/f"{ip}.log"); th.start(); self.extra_threads[ip]=th
+            th = StatefulPingThread(ip, self.extras_dir / f"{ip}.log")
+            th.start()
+            self.extra_threads[ip] = th
 
-        self.target_down_prev=False
-        self.current_episode_start: Optional[datetime]=None
-        self.current_episode_first_fault: Optional[Tuple[int,str,str]]=None
-        self.current_episode_route_changes=0
-        self.norm_sig_at_episode_start=""; self.norm_sig_at_episode_end=""
-        self.extras_snapshot_start_up:List[str]=[]; self.extras_snapshot_start_down:List[str]=[]
+        self.target_down_prev = False
+        self.current_episode_start: Optional[datetime] = None
+        self.current_episode_first_fault: Optional[Tuple[int, str, str]] = None
+        self.current_episode_route_changes = 0
+        self.norm_sig_at_episode_start = ""
+        self.norm_sig_at_episode_end   = ""
+        self.extras_snapshot_start_up:   List[str] = []
+        self.extras_snapshot_start_down: List[str] = []
 
-        self.hop_stats: Dict[str, Dict[str, int]]={}
-        self.first_fault_current_ip: Optional[str]=None
-        self.first_fault_active=False
-        self.last_agg_flush=time.time()
+        self.hop_stats: Dict[str, Dict[str, int]] = {}
+        self.first_fault_current_ip: Optional[str] = None
+        self.first_fault_active = False
+        self.last_agg_flush = time.time()
 
         if not self.summary_csv.exists():
-            with self.summary_csv.open("w",encoding="utf-8") as f:
+            with self.summary_csv.open("w", encoding="utf-8") as f:
                 f.write("timestamp,epoch,target_down,loss_hops_unfiltered,loss_hops_if_target_down,route_changed,route_signature\n")
         if not self.extras_csv.exists():
-            with self.extras_csv.open("w",encoding="utf-8") as f:
-                cols=",".join(self.extras)
+            with self.extras_csv.open("w", encoding="utf-8") as f:
+                cols = ",".join(self.extras)
                 f.write("timestamp,target_down" + ("," + cols if cols else "") + "\n")
         if not self.agg_csv.exists():
-            with self.agg_csv.open("w",encoding="utf-8") as f:
+            with self.agg_csv.open("w", encoding="utf-8") as f:
                 f.write("ip,loss_seconds_when_target_down,first_fault_events\n")
         if not self.episodes_csv.exists():
-            with self.episodes_csv.open("w",encoding="utf-8") as f:
+            with self.episodes_csv.open("w", encoding="utf-8") as f:
                 f.write("start,end,duration_s,first_fault_idx,first_fault_ip,prev_ip_before_fault,route_changes_in_episode,norm_sig_start,norm_sig_end,extras_up_at_start,extras_down_at_start\n")
         if not self.routechg_csv.exists():
-            with self.routechg_csv.open("w",encoding="utf-8") as f:
+            with self.routechg_csv.open("w", encoding="utf-8") as f:
                 f.write("timestamp,epoch_before,epoch_after,old_norm_sig,new_norm_sig\n")
-        with self.index_md.open("w",encoding="utf-8") as f:
+        with self.index_md.open("w", encoding="utf-8") as f:
             f.write(f"# NETWATCH запуск для {self.target}\n\n- Старт: {ts_human()}\n- Каталог: {self.root}\n")
             if self.extras: f.write(f"- Доп. IP для ping: {', '.join(self.extras)}\n")
 
-    def _new_epoch_full_log(self)->Path:
-        self.epoch_id+=1; p=self.root/f"mtr_full_epoch_{self.epoch_id}.log"
-        with p.open("a",encoding="utf-8") as f: f.write(f"{ts_br()} Новая эпоха #{self.epoch_id}\n")
-        self.last_rotation_at=datetime.now(); return p
+    def _new_epoch_full_log(self) -> Path:
+        self.epoch_id += 1
+        p = self.root / f"mtr_full_epoch_{self.epoch_id}.log"
+        with p.open("a", encoding="utf-8") as f:
+            f.write(f"{ts_br()} Новая эпоха #{self.epoch_id}\n")
+        self.last_rotation_at = datetime.now()
+        return p
 
-    def _snapshot_mtr(self)->Tuple[str,List[Hop]]:
+    def _snapshot_mtr(self) -> Tuple[str, List[Hop]]:
         try:
-            raw=subprocess.check_output(["mtr","-r","-w","-n","-c","1","-i","1",self.target], text=True, stderr=subprocess.STDOUT)
+            raw = subprocess.check_output(
+                ["mtr", "-r", "-w", "-n", "-c", "1", "-i", "1", self.target],
+                text=True, stderr=subprocess.STDOUT
+            )
         except subprocess.CalledProcessError as e:
-            raw=e.output or ""
+            raw = e.output or ""
         return raw, parse_mtr_report(raw)
 
-    def _ensure_hop_pingers(self,hops:List[Hop])->None:
-        ips_now=[h.host for h in hops if h.host!="???" and h.host!=self.target]
-        if MAX_HOP_PINGERS>0: ips_now=ips_now[:MAX_HOP_PINGERS]
+    def _ensure_hop_pingers(self, hops: List[Hop]) -> None:
+        ips_now = [h.host for h in hops if h.host != "???" and h.host != self.target]
+        if MAX_HOP_PINGERS > 0:
+            ips_now = ips_now[:MAX_HOP_PINGERS]
         for ip in ips_now:
             if ip not in self.pingers:
-                th=PingThread(ip,self.hops_dir/f"{ip}.txt"); th.start(); self.pingers[ip]=th
+                th = PingThread(ip, self.hops_dir / f"{ip}.txt")
+                th.start()
+                self.pingers[ip] = th
         for ip in list(self.pingers.keys()):
             if ip not in ips_now:
-                self.pingers[ip].stop(); self.pingers[ip].join(timeout=2); del self.pingers[ip]
+                self.pingers[ip].stop()
+                self.pingers[ip].join(timeout=2)
+                del self.pingers[ip]
 
-    def _update_baseline_exclusions(self,hops:List[Hop])->None:
-        if self.baseline_set: return
-        self.excluded_idxs={h.idx for h in hops if h.host=="???"}; self.baseline_set=True
+    def _update_baseline_exclusions(self, hops: List[Hop]) -> None:
+        if self.baseline_set:
+            return
+        self.excluded_idxs = {h.idx for h in hops if h.host == "???"}
+        self.baseline_set = True
 
-    def _maybe_rotate_epoch(self,norm_sig:str)->bool:
-        changed=(self.prev_norm_sig is not None and norm_sig!=self.prev_norm_sig)
+    def _maybe_rotate_epoch(self, norm_sig: str) -> bool:
+        changed = (self.prev_norm_sig is not None and norm_sig != self.prev_norm_sig)
         if self.prev_norm_sig is None:
-            self.prev_norm_sig=norm_sig; return False
+            self.prev_norm_sig = norm_sig
+            return False
         if not changed:
-            self.pending_sig=None; self.pending_count=0; return False
-        if self.pending_sig!=norm_sig: self.pending_sig=norm_sig; self.pending_count=1
-        else: self.pending_count+=1
-        enough=self.pending_count>=ROUTE_CHANGE_STABLE_SNAPSHOTS
-        gap_ok=(datetime.now()-self.last_rotation_at).total_seconds()>=ROTATION_MIN_GAP_SEC
+            self.pending_sig = None
+            self.pending_count = 0
+            return False
+        if self.pending_sig != norm_sig:
+            self.pending_sig = norm_sig
+            self.pending_count = 1
+        else:
+            self.pending_count += 1
+        enough = self.pending_count >= ROUTE_CHANGE_STABLE_SNAPSHOTS
+        gap_ok = (datetime.now() - self.last_rotation_at).total_seconds() >= ROTATION_MIN_GAP_SEC
         if enough and gap_ok:
-            old=self.prev_norm_sig; self.prev_norm_sig=norm_sig
-            old_epoch=self.epoch_id; self.full_log=self._new_epoch_full_log()
-            with self.routechg_csv.open("a",encoding="utf-8") as f:
+            old = self.prev_norm_sig
+            self.prev_norm_sig = norm_sig
+            old_epoch = self.epoch_id
+            self.full_log = self._new_epoch_full_log()
+            with self.routechg_csv.open("a", encoding="utf-8") as f:
                 f.write(f"{ts_human()},{old_epoch},{self.epoch_id},\"{old}\",\"{norm_sig}\"\n")
-            self.pending_sig=None; self.pending_count=0
+            self.pending_sig = None
+            self.pending_count = 0
             return True
         return True
 
-    def _append_summary(self,hops:List[Hop],target_down:bool,route_changed:bool,norm_sig:str)->None:
-        loss_unf=[f"{h.idx}:{h.host}" for h in hops if h.loss>0.0]
-        loss_cond=[f"{h.idx}:{h.host}" for h in hops if h.loss>0.0 and h.idx not in self.excluded_idxs] if target_down else []
-        with self.summary_csv.open("a",encoding="utf-8") as f:
-            f.write(",".join([ts_human(),str(self.epoch_id),"1" if target_down else "0",
-                              '"'+";".join(loss_unf)+'"',
-                              '"'+";".join(loss_cond)+'"',
-                              "1" if route_changed else "0",
-                              '"'+norm_sig+'"'])+"\n")
+    def _append_summary(self, hops: List[Hop], target_down: bool, route_changed: bool, norm_sig: str) -> None:
+        loss_unf  = [f"{h.idx}:{h.host}" for h in hops if h.loss > 0.0]
+        loss_cond = [f"{h.idx}:{h.host}" for h in hops if h.loss > 0.0 and h.idx not in self.excluded_idxs] if target_down else []
+        with self.summary_csv.open("a", encoding="utf-8") as f:
+            f.write(",".join([
+                ts_human(), str(self.epoch_id), "1" if target_down else "0",
+                '"' + ";".join(loss_unf)  + '"',
+                '"' + ";".join(loss_cond) + '"',
+                "1" if route_changed else "0",
+                '"' + norm_sig + '"'
+            ]) + "\n")
 
-    def _append_extras_snapshot(self,target_down:bool)->None:
-        if not self.extras: return
-        states=[]
-        for ip,th in self.extra_threads.items():
-            down,_,_=th.loss_state()
+    def _append_extras_snapshot(self, target_down: bool) -> None:
+        if not self.extras:
+            return
+        states = []
+        for ip, th in self.extra_threads.items():
+            down, _, _ = th.loss_state()
             states.append(("DOWN" if down else "UP"))
-        with self.extras_csv.open("a",encoding="utf-8") as f:
-            row=[ts_human(),"1" if target_down else "0"]+states
-            f.write(",".join(row)+"\n")
+        with self.extras_csv.open("a", encoding="utf-8") as f:
+            row = [ts_human(), "1" if target_down else "0"] + states
+            f.write(",".join(row) + "\n")
 
-    def _flush_agg_csv(self)->None:
-        if (time.time()-self.last_agg_flush)<AGG_FLUSH_EVERY_SEC: return
-        self.last_agg_flush=time.time()
-        with self.agg_csv.open("w",encoding="utf-8") as f:
+    def _flush_agg_csv(self) -> None:
+        if (time.time() - self.last_agg_flush) < AGG_FLUSH_EVERY_SEC:
+            return
+        self.last_agg_flush = time.time()
+        with self.agg_csv.open("w", encoding="utf-8") as f:
             f.write("ip,loss_seconds_when_target_down,first_fault_events\n")
-            for ip,st in sorted(self.hop_stats.items()):
+            for ip, st in sorted(self.hop_stats.items()):
                 f.write(f"{ip},{st.get('loss_sec',0)},{st.get('first_fault_events',0)}\n")
 
-    def _detect_first_fault(self,hops:List[Hop])->Optional[Tuple[int,str,str]]:
-        prev_ip=None
+    def _detect_first_fault(self, hops: List[Hop]) -> Optional[Tuple[int, str, str]]:
+        prev_ip = None
         for h in hops:
             if h.idx in self.excluded_idxs:
-                prev_ip=h.host if h.host!="???" else prev_ip; continue
-            problematic=(h.loss>0.0) or (h.host=="???")
-            if problematic: return (h.idx,h.host,prev_ip or "")
-            prev_ip=h.host if h.host!="???" else prev_ip
+                prev_ip = h.host if h.host != "???" else prev_ip
+                continue
+            problematic = (h.loss > 0.0) or (h.host == "???")
+            if problematic:
+                return (h.idx, h.host, prev_ip or "")
+            prev_ip = h.host if h.host != "???" else prev_ip
         return None
 
-    def _update_per_hop_counters(self,hops:List[Hop],target_down:bool,first_fault:Optional[Tuple[int,str,str]])->None:
+    def _update_per_hop_counters(self, hops: List[Hop], target_down: bool,
+                                 first_fault: Optional[Tuple[int, str, str]]) -> None:
         if not target_down:
-            self.first_fault_active=False; self.first_fault_current_ip=None; return
+            self.first_fault_active = False
+            self.first_fault_current_ip = None
+            return
         for h in hops:
-            if h.idx in self.excluded_idxs: continue
-            if h.loss>0.0:
-                st=self.hop_stats.setdefault(h.host,{"loss_sec":0,"first_fault_events":0})
-                st["loss_sec"]+=1
+            if h.idx in self.excluded_idxs:
+                continue
+            if h.loss > 0.0:
+                st = self.hop_stats.setdefault(h.host, {"loss_sec": 0, "first_fault_events": 0})
+                st["loss_sec"] += 1
         if first_fault:
-            _,ip,_=first_fault
-            if ip!=self.first_fault_current_ip or not self.first_fault_active:
-                st=self.hop_stats.setdefault(ip,{"loss_sec":0,"first_fault_events":0})
-                st["first_fault_events"]+=1
-                self.first_fault_current_ip=ip; self.first_fault_active=True
+            _, ip, _ = first_fault
+            if ip != self.first_fault_current_ip or not self.first_fault_active:
+                st = self.hop_stats.setdefault(ip, {"loss_sec": 0, "first_fault_events": 0})
+                st["first_fault_events"] += 1
+                self.first_fault_current_ip = ip
+                self.first_fault_active = True
         else:
-            self.first_fault_active=False; self.first_fault_current_ip=None
+            self.first_fault_active = False
+            self.first_fault_current_ip = None
 
-    def loop(self)->None:
+    def loop(self) -> None:
         while True:
-            t0=time.time()
-            raw,hops=self._snapshot_mtr()
-            header=f"===== {ts_human()} target={self.target} =====\n"
-            block=header+raw+"\n"
+            t0 = time.time()
+
+            raw, hops = self._snapshot_mtr()
+            header = f"===== {ts_human()} target={self.target} =====\n"
+            block  = header + raw + "\n"
             sys.stdout.write(block); sys.stdout.flush()
-            with self.full_log.open("a",encoding="utf-8") as f: f.write(block)
+            with self.full_log.open("a", encoding="utf-8") as f:
+                f.write(block)
 
             self._ensure_hop_pingers(hops)
             self._update_baseline_exclusions(hops)
 
-            norm_sig=normalized_signature(hops,self.excluded_idxs)
-            route_changed=self._maybe_rotate_epoch(norm_sig)
+            norm_sig = normalized_signature(hops, self.excluded_idxs)
+            route_changed = self._maybe_rotate_epoch(norm_sig)
 
             target_down, dur, since = self.target_pinger.loss_state()
             first_fault = self._detect_first_fault(hops) if target_down else None
 
-            if route_changed and target_down and dur>TARGET_LOSS_THRESHOLD_SEC:
-                with self.flaps_log.open("a",encoding="utf-8") as f:
-                    f.write(f"{ts_br()} ROUTE CHANGE while TARGET DOWN >{int(TARGET_LOSS_THRESHOLD_SEC)}s (since {since.strftime('%H:%M:%S') if since else 'n/a'})\n")
+            if route_changed and target_down and dur > TARGET_LOSS_THRESHOLD_SEC:
+                with self.flaps_log.open("a", encoding="utf-8") as f:
+                    info = f"since {since.strftime('%H:%M:%S')}" if since else "since n/a"
+                    f.write(f"{ts_br()} ROUTE CHANGE while TARGET DOWN >{int(TARGET_LOSS_THRESHOLD_SEC)}s ({info})\n")
 
-            loss_now=any((h.loss>0.0) and (h.idx not in self.excluded_idxs) for h in hops)
+            loss_now = any((h.loss > 0.0) and (h.idx not in self.excluded_idxs) for h in hops)
             if loss_now:
-                with self.events_log.open("a",encoding="utf-8") as f: f.write(block)
+                with self.events_log.open("a", encoding="utf-8") as f:
+                    f.write(block)
 
-            self._append_summary(hops,target_down,route_changed,norm_sig)
+            self._append_summary(hops, target_down, route_changed, norm_sig)
             self._append_extras_snapshot(target_down)
 
-            self._update_per_hop_counters(hops,target_down,first_fault)
+            self._update_per_hop_counters(hops, target_down, first_fault)
 
             if target_down and not self.target_down_prev:
-                self.current_episode_start=datetime.now()
-                self.current_episode_first_fault=first_fault
-                self.current_episode_route_changes=1 if route_changed else 0
-                self.norm_sig_at_episode_start=norm_sig
-                ups=[]; downs=[]
-                for ip,th in self.extra_threads.items():
-                    d,_,_=th.loss_state()
+                self.current_episode_start = datetime.now()
+                self.current_episode_first_fault = first_fault
+                self.current_episode_route_changes = 1 if route_changed else 0
+                self.norm_sig_at_episode_start = norm_sig
+                ups, downs = [], []
+                for ip, th in self.extra_threads.items():
+                    d, _, _ = th.loss_state()
                     (downs if d else ups).append(ip)
-                self.extras_snapshot_start_up=ups; self.extras_snapshot_start_down=downs
+                self.extras_snapshot_start_up = ups
+                self.extras_snapshot_start_down = downs
             elif target_down and self.target_down_prev:
-                if route_changed: self.current_episode_route_changes+=1
+                if route_changed:
+                    self.current_episode_route_changes += 1
             elif (not target_down) and self.target_down_prev:
-                end=datetime.now(); start=self.current_episode_start or end
-                dur_s=int((end-start).total_seconds())
-                ff_idx,ff_ip,prev_ip=(-1,"","")
-                if self.current_episode_first_fault: ff_idx,ff_ip,prev_ip=self.current_episode_first_fault
-                self.norm_sig_at_episode_end=norm_sig
-                with self.episodes_csv.open("a",encoding="utf-8") as f:
+                end   = datetime.now()
+                start = self.current_episode_start or end
+                dur_s = int((end - start).total_seconds())
+                ff_idx, ff_ip, prev_ip = (-1, "", "")
+                if self.current_episode_first_fault:
+                    ff_idx, ff_ip, prev_ip = self.current_episode_first_fault
+                self.norm_sig_at_episode_end = norm_sig
+                with self.episodes_csv.open("a", encoding="utf-8") as f:
                     f.write(",".join([
                         start.strftime("%Y-%m-%d %H:%M:%S"),
                         end.strftime("%Y-%m-%d %H:%M:%S"),
@@ -419,42 +525,54 @@ class NetwatchMTR:
                         f"\"{self.norm_sig_at_episode_end}\"",
                         f"\"{';'.join(self.extras_snapshot_start_up)}\"",
                         f"\"{';'.join(self.extras_snapshot_start_down)}\"",
-                    ])+"\n")
-                self.current_episode_start=None; self.current_episode_first_fault=None
-                self.current_episode_route_changes=0
-                self.norm_sig_at_episode_start=""; self.norm_sig_at_episode_end=""
-                self.extras_snapshot_start_up=[]; self.extras_snapshot_start_down=[]
+                    ]) + "\n")
+                self.current_episode_start = None
+                self.current_episode_first_fault = None
+                self.current_episode_route_changes = 0
+                self.norm_sig_at_episode_start = ""
+                self.norm_sig_at_episode_end = ""
+                self.extras_snapshot_start_up = []
+                self.extras_snapshot_start_down = []
 
-            self.target_down_prev=target_down
+            self.target_down_prev = target_down
             self._flush_agg_csv()
 
-            elapsed=time.time()-t0
-            if elapsed<SNAPSHOT_PERIOD_SEC: time.sleep(max(0.0,SNAPSHOT_PERIOD_SEC-elapsed))
+            elapsed = time.time() - t0
+            if elapsed < SNAPSHOT_PERIOD_SEC:
+                time.sleep(max(0.0, SNAPSHOT_PERIOD_SEC - elapsed))
 
 # -------------------------------- Вход --------------------------------
-def main()->None:
-    if len(sys.argv)>=2: target=sys.argv[1].strip()
-    else: target=input("Куда пингуем основную цель (например, 8.8.8.8)? ").strip()
-    if not target: print("Цель не задана."); sys.exit(1)
-
-    if len(sys.argv)>=3:
-        extras_csv=sys.argv[2]
+def main() -> None:
+    if len(sys.argv) >= 2:
+        target = sys.argv[1].strip()
     else:
-        extras_csv=input("Доп. IP через запятую (например: 10.0.0.1,203.0.113.10,203.0.113.1,75.75.75.75,75.75.76.76): ").strip()
-    extras=[x.strip() for x in (extras_csv.split(",") if extras_csv else []) if x.strip()]
+        target = input("Куда пингуем основную цель (например, 8.8.8.8)? ").strip()
+    if not target:
+        print("Цель не задана."); sys.exit(1)
+
+    if len(sys.argv) >= 3:
+        extras_csv = sys.argv[2]
+    else:
+        extras_csv = input("Доп. IP через запятую (например: 10.0.0.1,203.0.113.10,203.0.113.1,75.75.75.75,75.75.76.76): ").strip()
+    extras = [x.strip() for x in (extras_csv.split(",") if extras_csv else []) if x.strip()]
 
     ensure_mtr_or_reexec_with_sudo(target)
 
-    mon=NetwatchMTR(target,extras)
+    mon = NetwatchMTR(target, extras)
 
-    def on_sigint(signum,frame):
+    def on_sigint(signum, frame):
         print(f"\n{ts_br()} Завершение...")
-        for th in mon.pingers.values(): th.stop()
-        for th in mon.pingers.values(): th.join(timeout=2)
-        for th in mon.extra_threads.values(): th.stop()
-        for th in mon.extra_threads.values(): th.join(timeout=2)
+        for th in mon.pingers.values():
+            th.stop()
+        for th in mon.pingers.values():
+            th.join(timeout=2)
+        for th in mon.extra_threads.values():
+            th.stop()
+        for th in mon.extra_threads.values():
+            th.join(timeout=2)
         if mon.target_pinger:
-            mon.target_pinger.stop(); mon.target_pinger.join(timeout=2)
+            mon.target_pinger.stop()
+            mon.target_pinger.join(timeout=2)
         mon._flush_agg_csv()
         print(f"{ts_br()} Готово. Каталог: {mon.root}")
         sys.exit(0)
@@ -462,5 +580,5 @@ def main()->None:
     signal.signal(signal.SIGINT, on_sigint)
     mon.loop()
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
