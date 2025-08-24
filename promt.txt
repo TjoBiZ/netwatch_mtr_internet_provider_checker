@@ -1,3 +1,41 @@
+Goal
+Build a cross-platform (Ubuntu/macOS) diagnostic tool that continuously monitors end-to-end connectivity using mtr + OS ping, writes clean logs, and produces concise CSV summaries suitable for an ISP (Xfinity) escalation.
+
+Musts
+1) Use only system tools: mtr and ping. (gawk optional; if absent, add timestamps in Python.)
+2) One main target (e.g., 8.8.8.8). Additionally allow a comma-separated list of extra IPs to ping in parallel with OS ping only (no mtr). Recommendation for users: include WAN IP, WAN Default Gateway, and DNS servers from the router UI.
+3) mtr snapshot cadence = 1 sec (1 probe per hop per second). If mtr requires privileges, auto-reexec via sudo and prompt for the user’s password.
+4) Baseline exclusions: at start, any “???” hops present are permanently excluded from loss accounting until the route changes.
+5) Loss axiom: count loss on intermediate hops ONLY if the final target is DOWN at that second.
+6) Loss logging: 
+   - `mtr_events_lost.log` contains ONLY snapshots/blocks when loss is detected (per second) on any non-excluded hop.
+   - `loss_episodes.csv` records contiguous target-down episodes with start/end/duration, first faulty hop, previous hop, route signatures and whether the route changed during the episode; also record which extra IPs were UP/DOWN at the episode start.
+7) Route changes: form a normalized route signature (index:IP, with excluded “???”). If signature is different for 3 consecutive snapshots and at least 60s passed since last rotation, start a new epoch (files continue under the same run folder but `mtr_full_epoch_N.log` increases). Log changes to `route_changes.csv`.
+8) Continuous pings:
+   - Run OS `ping -i 1` to the main target (stateful classification UP/DOWN) -> `target_ping.log`.
+   - For each visible IP hop (except “???” and the final target), create a subfile `hop_pings/<IP>.txt` with continuous ping and timestamps.
+   - For each user-provided extra IP, ping continuously -> `extra_pings/<IP>.log`.
+9) Files to produce inside `netwatch_run_<target>_<timestamp>/`:
+   - `mtr_full_epoch_N.log` (per-second blocks), `mtr_events_lost.log` (loss only),
+     `mtr_route_flaps.log` (route change while target was DOWN >2s),
+     `summary.csv` (one row per second with route signature and loss lists),
+     `agg_per_hop.csv` (loss seconds & first-fault counters per hop, counted only when target was DOWN),
+     `loss_episodes.csv`, `route_changes.csv`,
+     `target_ping.log`, `hop_pings/<IP>.txt`, `extra_pings/<IP>.log`, `INDEX.md`.
+10) Extras status: every second write `extras_status.csv` → `timestamp,target_down,<extra1>,<extra2>...` as `UP/DOWN`.
+11) Route change bursts: if the route changes while the target is DOWN for >2s, append a human line to `mtr_route_flaps.log`.
+12) Performance & safety:
+    - Write streams line-by-line (no buffering in memory).
+    - Limit hop pingers to 32 concurrent files.
+13) Clean shutdown on Ctrl+C: stop all pingers, flush aggregations, print the run folder path.
+
+Non-goals
+- No third-party Python packages, no GUI, no network modifications.
+
+Deliverables
+- `netwatch_mtr_ru.py` (Russian), `netwatch_mtr_en.py` (English), `README.md` (EN primary + RU section), `.gitignore`.
+
+
 Технический Prompt (само-задание скрипта)
 	1.	Ввод цели: спросить или принять аргументом IPv4/хост (например, 8.8.8.8).
 	2.	Только mtr: каждые ~1 сек запускать mtr -r -w -n -c 1 -i 1 <target>. Блок выводить в консоль и писать в «полный лог» текущей эпохи.
